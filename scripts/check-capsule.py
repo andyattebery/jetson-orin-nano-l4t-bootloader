@@ -6,8 +6,12 @@ Usage: check-capsule.py STOCK.Cap NEW.Cap
 Passes only if the two capsules:
 - are the same kind of update: FMP image type, FW version and lowest supported version all equal;
 - carry the same images, keyed by partition name and board spec;
-- differ only in mb2 and VER, the build stamp;
+- differ only in mb2, in VER (the build stamp), and in the QSPI's backup GPTs' random GUIDs;
 - differ in mb2 for every spec that has one, which shows the MB2 BCT change reached every board.
+
+Every build gives the backup GPTs (secondary_gpt, secondary_gpt_backup) new random disk and
+partition GUIDs: NVIDIA's own capsule differs that way across its seven specs. So they're compared
+with those GUIDs and the two CRCs over them zeroed, after checking the rebuild's CRCs.
 
 Layouts:
 - EFI capsule: EFI_CAPSULE_HEADER, then an FMP capsule header with one payload item. The item is an
@@ -21,6 +25,7 @@ Layouts:
 import struct
 import sys
 import uuid
+import zlib
 
 FMP_CAPSULE_GUID = uuid.UUID("6dcbd5ed-e82d-4c44-bda1-7194199ad92a")
 NVIDIA_IMAGE_TYPE = uuid.UUID("bf0d4599-20d4-414e-b2c5-3595b1cda402")
@@ -30,10 +35,40 @@ BUP_ENTRY = "=40sIIII128s"
 # Images allowed to differ. mb2 carries the MB2 BCT, where the change is; VER is the build stamp.
 MAY_DIFFER = {"mb2", "VER"}
 MUST_DIFFER = "mb2"
+# Backup GPTs: the partition entries, then the GPT header in the last 512 bytes.
+GPT_IMAGES = {"secondary_gpt", "secondary_gpt_backup"}
 
 
 def fail(msg):
     sys.exit(f"check-capsule.py: {msg}")
+
+
+def gpt_without_guids(image, where):
+    """A backup GPT image with its disk GUID, partition GUIDs and both CRCs zeroed, once its CRCs
+    are checked. Header fields, from the UEFI spec: HeaderSize at 12, HeaderCRC32 at 16, DiskGUID at
+    56, then PartitionEntryLBA, NumberOfPartitionEntries, SizeOfPartitionEntry and
+    PartitionEntryArrayCRC32 from 72. Each entry's unique partition GUID is at 16."""
+    h = len(image) - 512
+    if h < 0 or image[h:h + 8] != b"EFI PART":
+        fail(f"{where}: not a backup GPT; there's no 'EFI PART' header in its last 512 bytes")
+    header_size, header_crc = struct.unpack_from("<II", image, h + 12)
+    _entries_lba, count, entry_size, entries_crc = struct.unpack_from("<QIII", image, h + 72)
+    first = h - count * entry_size
+    if header_size < 92 or header_size > 512 or first < 0:
+        fail(f"{where}: GPT header size {header_size} or {count} entries of {entry_size} bytes don't fit")
+    header = bytearray(image[h:h + header_size])
+    header[16:20] = bytes(4)
+    if zlib.crc32(header) != header_crc:
+        fail(f"{where}: the GPT header's CRC doesn't match")
+    if zlib.crc32(image[first:h]) != entries_crc:
+        fail(f"{where}: the GPT partition entries' CRC doesn't match")
+    out = bytearray(image)
+    out[h + 16:h + 20] = bytes(4)
+    out[h + 56:h + 72] = bytes(16)
+    out[h + 88:h + 92] = bytes(4)
+    for e in range(first, h, entry_size):
+        out[e + 16:e + 32] = bytes(16)
+    return bytes(out)
 
 
 def parse(path):
@@ -105,9 +140,12 @@ def main():
         fail(f"different images. Only in NVIDIA's: {only_stock}. Only in the rebuild: {only_new}")
 
     differ = sorted(k for k in stock["images"] if stock["images"][k] != new["images"][k])
-    unexpected = [k for k in differ if k[0] not in MAY_DIFFER]
+    gpt_guids_only = [k for k in differ if k[0] in GPT_IMAGES and
+                      gpt_without_guids(stock["images"][k], f"NVIDIA's {k}") ==
+                      gpt_without_guids(new["images"][k], f"the rebuild's {k}")]
+    unexpected = [k for k in differ if k[0] not in MAY_DIFFER and k not in gpt_guids_only]
     if unexpected:
-        fail(f"images other than {sorted(MAY_DIFFER)} differ: {unexpected}")
+        fail(f"images other than {sorted(MAY_DIFFER)}, and other than GPT GUIDs, differ: {unexpected}")
     mb2 = sorted(k for k in stock["images"] if k[0] == MUST_DIFFER)
     if not mb2:
         fail("no mb2 image in the capsule")
@@ -118,7 +156,8 @@ def main():
     specs = sorted({k[1] for k in stock["images"]})
     print(f"check-capsule.py: OK. FW version {new['fw_version']:#x}, lowest {new['lowest_version']:#x}.")
     print(f"  {len(new['images'])} images over {len(specs)} specs (common included); differing: "
-          f"{len(differ)} ({', '.join(sorted({k[0] for k in differ}))}).")
+          f"{len(differ)} ({', '.join(sorted({k[0] for k in differ}))}), of which "
+          f"{len(gpt_guids_only)} GPTs differ only in their random GUIDs.")
     print(f"  mb2 changed for all {len(mb2)} specs: {', '.join(k[1] or 'common' for k in mb2)}")
 
 

@@ -57,7 +57,10 @@ The build stops, and nothing is published, unless:
 - the rebuilt capsule matches NVIDIA's (`scripts/check-capsule.py`):
   - the same FW version;
   - the same images;
-  - differences only in `mb2` and `VER` (the build stamp);
+  - differences only in `mb2`, `VER` (the build stamp) and the QSPI's backup GPTs. Every build gives
+    each GPT new random disk and partition GUIDs, as NVIDIA's own capsule shows across its board
+    specs. So the GPTs are compared with those GUIDs and their CRCs zeroed, and the rebuild's CRCs
+    must check out;
   - `mb2` changed for every board spec;
 - the repacked package has NVIDIA's version plus the suffix, NVIDIA's `Depends` and install script,
   and the rebuilt capsule;

@@ -1,0 +1,50 @@
+# Builds the rebuilt nvidia-l4t-bootloader and publishes the L4T release to Forgejo's Debian
+# registry (README.md). Runs on a push that changes versions.env, or by hand from the Actions tab.
+name: build
+
+on:
+  push:
+    paths:
+      - versions.env
+  workflow_dispatch:
+
+jobs:
+  build:
+    # The runner registered on this repository only. Its label runs each job as root in a
+    # digest-pinned ubuntu:24.04 (README.md, "The runner").
+    runs-on: l4t-build
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # No actions/checkout: it needs Node.js, which ubuntu:24.04 doesn't have. The job's own token
+      # reads this repository's archive at the pushed commit.
+      - name: Fetch this commit
+        env:
+          TOKEN: ${{ forgejo.token }}
+          SERVER_URL: ${{ forgejo.server_url }}
+          REPOSITORY: ${{ forgejo.repository }}
+          SHA: ${{ forgejo.sha }}
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl
+          curl -fsSL -H "Authorization: token $TOKEN" -o src.tar.gz \
+            "${SERVER_URL%/}/api/v1/repos/$REPOSITORY/archive/$SHA.tar.gz"
+          mkdir src
+          tar -xzf src.tar.gz -C src --strip-components=1
+
+      - name: Build
+        run: |
+          cd src
+          mkdir work
+          ./scripts/build.sh --work-dir work --out out
+
+      - name: Publish
+        env:
+          FORGEJO_URL: ${{ forgejo.server_url }}
+          PACKAGES_USER: ${{ vars.PACKAGES_USER }}
+          PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          cd src
+          ./scripts/publish.sh out

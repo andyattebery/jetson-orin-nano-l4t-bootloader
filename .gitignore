@@ -1,0 +1,3 @@
+# Local builds (README.md): sudo scripts/build.sh --work-dir work --out out
+/work/
+/out/

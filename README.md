@@ -1,9 +1,10 @@
 # jetson-orin-nano-l4t-bootloader
 
 Builds NVIDIA's `nvidia-l4t-bootloader` for Jetson Orin Nano and NX modules on carriers without an
-EEPROM, and publishes it to a Debian repo with the rest of the Jetson Linux (L4T) release. A node
-reads that repo with its own apt, so a new L4T release reaches the module's QSPI through
-`apt upgrade` and a reboot.
+EEPROM, and publishes it to a Debian repo with the rest of the Jetson Linux (L4T) release. A daily
+check does this for each new NVIDIA release with the same major version. A node reads that repo
+with its own apt, so a new L4T release reaches the module's QSPI through `apt upgrade` and a
+reboot.
 
 ## Why
 
@@ -24,12 +25,14 @@ NVIDIA's other packages for the release, unchanged. The research behind it:
 
 | Path | What |
 |---|---|
-| `versions.env` | The L4T release, its BSP pin, the rebuild's version suffix, and where it's published. |
+| `versions.env` | The L4T release, its BSP pin, the rebuild's version suffix, and where it's published. The daily check rewrites the release and its pin. |
 | `scripts/build.sh` | Builds the rebuild and collects the release (x86-64 Ubuntu 24.04, as root). |
 | `scripts/check-capsule.py` | Compares the rebuilt capsule with NVIDIA's, image by image. |
 | `scripts/check-nvidia-debs.py` | Checks the other debs against NVIDIA's apt index. |
+| `scripts/check-release.py` | Looks for a newer Jetson Linux release and rewrites `versions.env`. jetson-orin-nano-l4t-minimal's, unchanged (Traps). |
+| `scripts/commit-versions.py` | Commits `versions.env` through Forgejo's API, for the workflow. |
 | `scripts/publish.sh` | Uploads the release to Forgejo's Debian registry and checks its index. |
-| `.forgejo/workflows/build.yml` | Runs `build.sh`, then `publish.sh`, on a push that changes `versions.env`, or by hand. |
+| `.forgejo/workflows/build.yml` | Runs `build.sh`, then `publish.sh`: on a push that changes `versions.env`, by hand, and daily when NVIDIA has a newer release. |
 
 ## What a build does
 
@@ -72,16 +75,44 @@ and SHA-256.
 
 ## A new L4T release
 
-1. In `versions.env`, set `L4T_VERSION`, `BSP_URL` and `BSP_SHA256`.
-   - NVIDIA publishes no checksum, so compute it once: `curl -fL <url> | sha256sum`.
-   - Set `NVIDIA_INDEX_URL` too if the release is in a new suite, such as r39.3.
-   - Set `REPACK_SUFFIX` back to `tp1`.
-2. Commit and push to `origin`, which is Forgejo. The workflow builds and publishes, and Forgejo
-   push-mirrors the commit to GitHub.
-3. On each node, once the workflow has finished: `sudo apt update && sudo apt upgrade`, then
-   reboot.
+**Within the same major version, it's automatic.** Every day at 04:41 Central time, the workflow
+runs [scripts/check-release.py](scripts/check-release.py), the release check from
+[jetson-orin-nano-l4t-minimal](https://github.com/andyattebery/jetson-orin-nano-l4t-minimal),
+unchanged.
+1. **Finding releases:** it reads NVIDIA's
+   [Jetson Linux archive](https://developer.nvidia.com/embedded/jetson-linux-archive), where each
+   release is a link whose text is its version, and the main Jetson Linux page.
+2. **The bump:** for the newest release with `versions.env`'s major version, it downloads the BSP
+   once for its SHA-256 and rewrites `L4T_VERSION`, `BSP_URL` and `BSP_SHA256`.
+   - `NVIDIA_INDEX_URL` follows `L4T_VERSION`: NVIDIA's apt suite is the release's major.minor.
+   - `REPACK_SUFFIX` stays as it is.
+3. **The build,** with all of its checks (The checks).
+4. **The commit:** once the build has passed, the workflow commits `versions.env` to `main` through
+   Forgejo's API, as `jetson-orin-nano-l4t-bootloader <noreply@invalid>`.
+5. **The publish.**
 
-Rebuilding a release that's already published needs a higher `REPACK_SUFFIX`, such as `tp2`.
+A release that fails to build leaves `versions.env` as it was, so the next day's check tries it
+again. That includes a release whose packages aren't in NVIDIA's apt index yet:
+`check-nvidia-debs.py` stops its build until they are.
+
+Forgejo mails a failed run to the repository's owner, if it has a mailer. To run the check by hand:
+the Actions tab, "build", "Run workflow", with "Look for a newer NVIDIA release first" ticked.
+
+**A newer major version is only reported, in the run's log.** It can drop the module or move
+NVIDIA's apt index: R36's was under `jetson/t234/`, R39's is under `jetson/som/`.
+jetson-orin-nano-l4t-minimal's check opens an issue for it. Moving to it is by hand:
+1. Check that the release still builds `CAPSULE` from `BUP_SPEC`, and where its apt index is.
+2. In `versions.env`, set `L4T_VERSION`, `BSP_URL` and `BSP_SHA256`, and the path in
+   `NVIDIA_INDEX_URL` if NVIDIA moved it. NVIDIA publishes no checksum, so compute it once:
+   `curl -fL <url> | sha256sum`.
+3. Commit and push to `origin`, which is Forgejo. The workflow builds and publishes, and Forgejo
+   push-mirrors the commit to GitHub.
+
+**Either way,** on each node once the workflow has finished: `sudo apt update && sudo apt upgrade`,
+then reboot.
+
+Rebuilding a release that's already published needs a higher `REPACK_SUFFIX`, such as `tp2`. A new
+release keeps the suffix.
 
 **By hand**, on x86-64 Ubuntu 24.04 with 15 GiB free:
 ```
@@ -114,7 +145,7 @@ Pin-Priority: 990
 - **The pin:** everything the repo carries wins at 990 against NVIDIA's 600. So a new release
   reaches the node only with its rebuild, and NVIDIA's own bootloader never installs (-1).
 - **First boot:** the homelab's Jetson sets all three up then, from
-  `jetson/cloud-init/user-data.tpl` in homelab-infrastructure.
+  `turingpi/jetson/cloud-init/user-data.tpl` in homelab-infrastructure.
 
 ## The runner
 
@@ -130,7 +161,8 @@ The workflow runs on a Forgejo Actions runner with the label `l4t-build`:
 ## Traps
 
 - **Run apt on a node only after the workflow has finished, and never `dist-upgrade` while it
-  runs.** The workflow uploads one deb at a time.
+  runs.** The workflow uploads one deb at a time. It runs every day at 04:41 Central time, and a run
+  that finds a new release publishes it.
   - Mid-upload, `apt upgrade` keeps back everything tied to the bootloader by exact versions.
   - `apt dist-upgrade`, and `full-upgrade`, remove `nvidia-l4t-bootloader` and `nvidia-l4t-bsp`
     instead, to move the rest. Later upgrades don't reinstall them.
@@ -138,6 +170,9 @@ The workflow runs on a Forgejo Actions runner with the label `l4t-build`:
 - **The registry refuses a version it already has**, with 409, even for identical bytes.
   `publish.sh` treats 409 as already published, and its index check catches a stored file that
   differs. To change a published version, raise `REPACK_SUFFIX`.
+- **A failed publish isn't retried.** The commit comes before it, so the next day's check finds
+  nothing newer. Run the workflow by hand without the check: it builds and publishes
+  `versions.env`'s release. If an upload got 500, the next trap comes first.
 - **A 500 on upload can leave a deb stored but missing from the index.** Forgejo rebuilds the index
   after the upload commits. A re-run then gets 409 for that deb, and the index check keeps failing.
   To recover, delete that version and run the workflow again:
@@ -147,3 +182,12 @@ The workflow runs on a Forgejo Actions runner with the label `l4t-build`:
 - **Only the capsule for `jetson-orin-nano-devkit-super` is rebuilt.** The package's other capsules
   stay NVIDIA's, so the rebuild isn't for a module whose install script picks one of those.
 - **Push to Forgejo.** GitHub is its push mirror, and GitHub doesn't run `.forgejo/workflows/`.
+- **The workflow commits to `main`.** A release from the daily check is a commit by
+  `jetson-orin-nano-l4t-bootloader`, so pull before pushing.
+- **A push that changes `versions.env` without a new release or a higher `REPACK_SUFFIX` fails at
+  the publish.** It rebuilds the bootloader, whose bytes differ from the published one (a new build
+  stamp and new GPT GUIDs), so the registry answers 409 and the index check fails. The registry is
+  unchanged. Don't avoid it with `[skip ci]`: Forgejo then also skips moving the daily check to the
+  new commit, and the check's next commit gets 409.
+- **`scripts/check-release.py` is a copy** of jetson-orin-nano-l4t-minimal's, byte for byte. A fix
+  to one belongs in the other, and nothing checks that they match.

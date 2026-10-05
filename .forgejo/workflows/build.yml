@@ -1,5 +1,7 @@
 # Builds the rebuilt nvidia-l4t-bootloader and publishes the L4T release to Forgejo's Debian
-# registry (README.md). Runs on a push that changes versions.env, or by hand from the Actions tab.
+# registry (README.md). Runs on a push that changes versions.env, by hand from the Actions tab, and
+# daily to look for a newer NVIDIA release: one with the same major version is built, committed to
+# versions.env, then published.
 name: build
 
 on:
@@ -7,6 +9,21 @@ on:
     paths:
       - versions.env
   workflow_dispatch:
+    inputs:
+      check:
+        description: Look for a newer NVIDIA release first, and build only if there is one
+        type: boolean
+        default: false
+  # Daily, at night: a release publishes one deb at a time, and no node should run apt meanwhile
+  # (README.md, "Traps"). Clear of the daylight-saving change at 02:00, when Forgejo skips or
+  # repeats runs.
+  schedule:
+    - cron: '41 4 * * *'
+      timezone: America/Chicago
+
+# A scheduled run has no user, so Forgejo mails its failures to the repository's owner, if it has a
+# mailer. Without this key it mails nothing.
+enable-email-notifications: true
 
 jobs:
   build:
@@ -19,7 +36,7 @@ jobs:
         shell: bash
     steps:
       # No actions/checkout: it needs Node.js, which ubuntu:24.04 doesn't have. The job's own token
-      # reads this repository's archive at the pushed commit.
+      # reads this repository's archive at the run's commit. python3 runs the release check.
       - name: Fetch this commit
         env:
           TOKEN: ${{ forgejo.token }}
@@ -28,19 +45,56 @@ jobs:
           SHA: ${{ forgejo.sha }}
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl
+          apt-get install -y --no-install-recommends ca-certificates curl python3
           curl -fsSL -H "Authorization: token $TOKEN" -o src.tar.gz \
             "${SERVER_URL%/}/api/v1/repos/$REPOSITORY/archive/$SHA.tar.gz"
           mkdir src
           tar -xzf src.tar.gz -C src --strip-components=1
 
+      # A push, or a manual run without "check", builds its own commit. The schedule, or a manual
+      # run with "check", builds only a newer NVIDIA release with the same major version.
+      - name: Look for a newer NVIDIA release
+        id: decide
+        env:
+          CHECK: ${{ forgejo.event_name == 'schedule' || inputs.check }}
+        run: |
+          cd src
+          if [[ "$CHECK" != true ]]; then
+            echo build=true >>"$FORGEJO_OUTPUT"
+            exit 0
+          fi
+          cp versions.env ../versions.env.before
+          scripts/check-release.py --update
+          if cmp -s versions.env ../versions.env.before; then
+            echo build=false >>"$FORGEJO_OUTPUT"
+          else
+            { echo build=true; echo commit=true; } >>"$FORGEJO_OUTPUT"
+          fi
+
       - name: Build
+        if: steps.decide.outputs.build == 'true'
         run: |
           cd src
           mkdir work
           ./scripts/build.sh --work-dir work --out out
 
+      # After the build, so a release that fails to build leaves versions.env as it was and the next
+      # day's check finds it again. Before the publish, so nothing is published that versions.env
+      # doesn't record.
+      - name: Commit the new release to versions.env
+        if: steps.decide.outputs.commit == 'true'
+        env:
+          FORGEJO_URL: ${{ forgejo.server_url }}
+          REPOSITORY: ${{ forgejo.repository }}
+          SHA: ${{ forgejo.sha }}
+          RUN_NUMBER: ${{ forgejo.run_number }}
+          TOKEN: ${{ forgejo.token }}
+        run: |
+          cd src
+          ./scripts/commit-versions.py
+
       - name: Publish
+        if: steps.decide.outputs.build == 'true'
         env:
           FORGEJO_URL: ${{ forgejo.server_url }}
           PACKAGES_USER: ${{ vars.PACKAGES_USER }}

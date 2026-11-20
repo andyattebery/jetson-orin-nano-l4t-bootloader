@@ -30,7 +30,7 @@ NVIDIA's other packages for the release, unchanged. The research behind it:
 | `scripts/check-capsule.py` | Compares the rebuilt capsule with NVIDIA's, image by image. |
 | `scripts/check-nvidia-debs.py` | Checks the other debs against NVIDIA's apt index. |
 | `scripts/check-release.py` | Looks for a newer Jetson Linux release and rewrites `versions.env`. jetson-orin-nano-l4t-minimal's, unchanged (Traps). |
-| `scripts/commit-versions.py` | Commits `versions.env` through Forgejo's API, for the workflow. |
+| `scripts/commit-versions.py` | Commits `versions.env` with git and the job's token, for the workflow. |
 | `scripts/publish.sh` | Uploads the release to Forgejo's Debian registry and checks its index. |
 | `.forgejo/workflows/build.yml` | Runs `build.sh`, then `publish.sh`: on a push that changes `versions.env`, by hand, and daily when NVIDIA has a newer release. |
 
@@ -87,8 +87,8 @@ unchanged.
    - `NVIDIA_INDEX_URL` follows `L4T_VERSION`: NVIDIA's apt suite is the release's major.minor.
    - `REPACK_SUFFIX` stays as it is.
 3. **The build,** with all of its checks (The checks).
-4. **The commit:** once the build has passed, the workflow commits `versions.env` to `main` through
-   Forgejo's API, as `jetson-orin-nano-l4t-bootloader <noreply@invalid>`.
+4. **The commit:** once the build has passed, the workflow commits `versions.env` to `main` with
+   git, pushing with the job's token, as `jetson-orin-nano-l4t-bootloader <noreply@invalid>`.
 5. **The publish.**
 
 A release that fails to build leaves `versions.env` as it was, so the next day's check tries it
@@ -184,10 +184,18 @@ The workflow runs on a Forgejo Actions runner with the label `l4t-build`:
 - **Push to Forgejo.** GitHub is its push mirror, and GitHub doesn't run `.forgejo/workflows/`.
 - **The workflow commits to `main`.** A release from the daily check is a commit by
   `jetson-orin-nano-l4t-bootloader`, so pull before pushing.
+- **The commit goes through git, not Forgejo's contents API.** With the job's token, Forgejo 15's
+  contents API answers a write with 500 and an empty message. Its internal push doesn't carry the
+  token's permission (`modules/repository/env.go` sets no `GITEA_ACTION_PERM`), so the pre-receive
+  hook refuses it: "User 'forgejo-actions' is not allowed to push to branch 'main'". That's only in
+  Forgejo's log. A git push with the same token carries the permission.
+  - Branch protection on `main` would break the git push too, per Forgejo issue #15275: there, the
+    hook fails on the Actions user with a 500.
 - **A push that changes `versions.env` without a new release or a higher `REPACK_SUFFIX` fails at
   the publish.** It rebuilds the bootloader, whose bytes differ from the published one (a new build
   stamp and new GPT GUIDs), so the registry answers 409 and the index check fails. The registry is
   unchanged. Don't avoid it with `[skip ci]`: Forgejo then also skips moving the daily check to the
-  new commit, and the check's next commit gets 409.
+  new commit, and the check's next commit is refused, because `versions.env` on `main` no longer
+  matches the check's commit.
 - **`scripts/check-release.py` is a copy** of jetson-orin-nano-l4t-minimal's, byte for byte. A fix
   to one belongs in the other, and nothing checks that they match.

@@ -80,7 +80,8 @@ jobs:
 
       # After the build, so a release that fails to build leaves versions.env as it was and the next
       # day's check finds it again. Before the publish, so nothing is published that versions.env
-      # doesn't record.
+      # doesn't record. It pushes with git: Forgejo's contents API can't commit with the job's token
+      # (README.md, "Traps").
       - name: Commit the new release to versions.env
         if: steps.decide.outputs.commit == 'true'
         env:
@@ -90,6 +91,7 @@ jobs:
           RUN_NUMBER: ${{ forgejo.run_number }}
           TOKEN: ${{ forgejo.token }}
         run: |
+          apt-get install -y --no-install-recommends git
           cd src
           ./scripts/commit-versions.py
 
